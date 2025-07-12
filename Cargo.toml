@@ -2,5 +2,20 @@
 name = "avmnif-rs"
 version = "0.1.0"
 edition = "2021"
+description     = "Safe NIF toolkit for AtomVM written in Rust"
+license         = "Apache-2.0"
+repository      = "https://github.com/HeroesLament/avmnif-rs"
+documentation   = "https://docs.rs/avmnif-rs"
+readme          = "README.md"
 
 [dependencies]
+cc = "1.2.29"
+paste = "1.0.15"
+
+
+[features]
+default = []          # keep the crate tiny by default
+std = []              # enable when host-testing or linking against std
+
+[package.metadata.docs.rs]
+all-features = true
