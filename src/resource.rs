@@ -1,11 +1,11 @@
 //! Resource management macros for AtomVM NIFs
 //! 
-//! Provides safe Rust wrappers around AtomVM's resource NIF API
+//! Provides safe Rust wrappers around AtomVM's resource NIF API with trait abstraction
 
-use crate::term::{NifError, NifResult, Term};
+use crate::term::{NifError, NifResult};
 use core::ffi::{c_void, c_char, c_int, c_uint};
-
-use alloc::string::{String, ToString};
+use alloc::format;
+use alloc::boxed::Box;
 
 // Suppress naming warnings for FFI compatibility
 #[allow(non_camel_case_types)]
@@ -53,6 +53,7 @@ pub struct ErlNifResourceTypeInit {
 
 /// Resource creation flags
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(non_camel_case_types)]
 pub enum ErlNifResourceFlags {
     ERL_NIF_RT_CREATE = 1,
@@ -61,6 +62,7 @@ pub enum ErlNifResourceFlags {
 
 /// Select mode flags
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(non_camel_case_types)]
 pub enum ErlNifSelectFlags {
     ERL_NIF_SELECT_READ = 1,
@@ -131,6 +133,429 @@ extern "C" {
     ) -> c_int;
 }
 
+/// Errors that can occur during resource operations
+#[derive(Debug, PartialEq, Clone)]
+pub enum ResourceError {
+    /// Resource name is invalid (empty or too long)
+    InvalidName,
+    /// Memory allocation failed
+    OutOfMemory,
+    /// Invalid resource type pointer
+    BadResourceType,
+    /// Invalid argument provided
+    BadArg,
+    /// Resource type initialization failed
+    InitializationFailed,
+    /// Resource not found or wrong type
+    ResourceNotFound,
+    /// Operation not supported
+    NotSupported,
+}
+
+impl From<ResourceError> for NifError {
+    fn from(err: ResourceError) -> Self {
+        match err {
+            ResourceError::OutOfMemory => NifError::OutOfMemory,
+            ResourceError::BadArg 
+            | ResourceError::BadResourceType 
+            | ResourceError::ResourceNotFound 
+            | ResourceError::InvalidName 
+            | ResourceError::InitializationFailed 
+            | ResourceError::NotSupported => NifError::BadArg,
+        }
+    }
+}
+
+/// Trait abstraction for resource management operations
+/// 
+/// This allows for dependency injection and makes the resource system testable
+/// while maintaining the same interface as the original FFI functions.
+pub trait ResourceManager: Send + Sync {
+    /// Initialize a new resource type
+    fn init_resource_type(
+        &mut self,
+        env: *mut ErlNifEnv,
+        name: &str,
+        init: &ErlNifResourceTypeInit,
+        flags: ErlNifResourceFlags,
+    ) -> Result<*mut ErlNifResourceType, ResourceError>;
+
+    /// Allocate memory for a new resource
+    fn alloc_resource(
+        &self,
+        resource_type: *mut ErlNifResourceType,
+        size: c_uint,
+    ) -> Result<*mut c_void, ResourceError>;
+
+    /// Create an Erlang term from a resource pointer
+    fn make_resource(
+        &self,
+        env: *mut ErlNifEnv,
+        obj: *mut c_void,
+    ) -> Result<ERL_NIF_TERM, ResourceError>;
+
+    /// Extract a resource pointer from an Erlang term
+    fn get_resource(
+        &self,
+        env: *mut ErlNifEnv,
+        term: ERL_NIF_TERM,
+        resource_type: *mut ErlNifResourceType,
+    ) -> Result<*mut c_void, ResourceError>;
+
+    /// Increment resource reference count
+    fn keep_resource(&self, obj: *mut c_void) -> Result<(), ResourceError>;
+
+    /// Decrement resource reference count
+    fn release_resource(&self, obj: *mut c_void) -> Result<(), ResourceError>;
+
+    /// Select on file descriptors for I/O readiness
+    fn select(
+        &self,
+        env: *mut ErlNifEnv,
+        event: ErlNifEvent,
+        mode: ErlNifSelectFlags,
+        obj: *mut c_void,
+        pid: *const ErlNifPid,
+        reference: ERL_NIF_TERM,
+    ) -> Result<(), ResourceError>;
+
+    /// Monitor a process for termination
+    fn monitor_process(
+        &self,
+        env: *mut ErlNifEnv,
+        obj: *mut c_void,
+        target_pid: *const ErlNifPid,
+        mon: *mut ErlNifMonitor,
+    ) -> Result<(), ResourceError>;
+
+    /// Remove a process monitor
+    fn demonitor_process(
+        &self,
+        env: *mut ErlNifEnv,
+        obj: *mut c_void,
+        mon: *const ErlNifMonitor,
+    ) -> Result<(), ResourceError>;
+}
+
+/// Production implementation using real AtomVM FFI calls
+#[derive(Debug, Default)]
+pub struct AtomVMResourceManager;
+
+impl AtomVMResourceManager {
+    /// Create a new AtomVM resource manager
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ResourceManager for AtomVMResourceManager {
+    fn init_resource_type(
+        &mut self,
+        env: *mut ErlNifEnv,
+        name: &str,
+        init: &ErlNifResourceTypeInit,
+        flags: ErlNifResourceFlags,
+    ) -> Result<*mut ErlNifResourceType, ResourceError> {
+        // Validate input parameters
+        if env.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+        if name.is_empty() || name.len() > 255 {
+            return Err(ResourceError::InvalidName);
+        }
+
+        // Ensure name is null-terminated for C FFI
+        let name_cstr = format!("{}\0", name);
+        let mut tried_flags = flags;
+        
+        let resource_type = unsafe {
+            enif_init_resource_type(
+                env,
+                name_cstr.as_ptr() as *const c_char,
+                init,
+                flags,
+                &mut tried_flags,
+            )
+        };
+
+        if resource_type.is_null() {
+            Err(ResourceError::InitializationFailed)
+        } else {
+            Ok(resource_type)
+        }
+    }
+
+    fn alloc_resource(
+        &self,
+        resource_type: *mut ErlNifResourceType,
+        size: c_uint,
+    ) -> Result<*mut c_void, ResourceError> {
+        if resource_type.is_null() {
+            return Err(ResourceError::BadResourceType);
+        }
+        if size == 0 {
+            return Err(ResourceError::BadArg);
+        }
+
+        let ptr = unsafe { enif_alloc_resource(resource_type, size) };
+        if ptr.is_null() {
+            Err(ResourceError::OutOfMemory)
+        } else {
+            Ok(ptr)
+        }
+    }
+
+    fn make_resource(
+        &self,
+        env: *mut ErlNifEnv,
+        obj: *mut c_void,
+    ) -> Result<ERL_NIF_TERM, ResourceError> {
+        if env.is_null() || obj.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+
+        let term = unsafe { enif_make_resource(env, obj) };
+        if term == 0 {
+            Err(ResourceError::BadArg)
+        } else {
+            Ok(term)
+        }
+    }
+
+    fn get_resource(
+        &self,
+        env: *mut ErlNifEnv,
+        term: ERL_NIF_TERM,
+        resource_type: *mut ErlNifResourceType,
+    ) -> Result<*mut c_void, ResourceError> {
+        if env.is_null() || resource_type.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+
+        let mut obj_ptr: *mut c_void = core::ptr::null_mut();
+        let success = unsafe {
+            enif_get_resource(env, term, resource_type, &mut obj_ptr)
+        };
+
+        if success != 0 && !obj_ptr.is_null() {
+            Ok(obj_ptr)
+        } else {
+            Err(ResourceError::ResourceNotFound)
+        }
+    }
+
+    fn keep_resource(&self, obj: *mut c_void) -> Result<(), ResourceError> {
+        if obj.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+
+        let result = unsafe { enif_keep_resource(obj) };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(ResourceError::BadArg)
+        }
+    }
+
+    fn release_resource(&self, obj: *mut c_void) -> Result<(), ResourceError> {
+        if obj.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+
+        let result = unsafe { enif_release_resource(obj) };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(ResourceError::BadArg)
+        }
+    }
+
+    fn select(
+        &self,
+        env: *mut ErlNifEnv,
+        event: ErlNifEvent,
+        mode: ErlNifSelectFlags,
+        obj: *mut c_void,
+        pid: *const ErlNifPid,
+        reference: ERL_NIF_TERM,
+    ) -> Result<(), ResourceError> {
+        if env.is_null() || obj.is_null() || pid.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+
+        let result = unsafe {
+            enif_select(env, event, mode, obj, pid, reference)
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(ResourceError::BadArg)
+        }
+    }
+
+    fn monitor_process(
+        &self,
+        env: *mut ErlNifEnv,
+        obj: *mut c_void,
+        target_pid: *const ErlNifPid,
+        mon: *mut ErlNifMonitor,
+    ) -> Result<(), ResourceError> {
+        if env.is_null() || obj.is_null() || target_pid.is_null() || mon.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+
+        let result = unsafe {
+            enif_monitor_process(env, obj, target_pid, mon)
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(ResourceError::BadArg)
+        }
+    }
+
+    fn demonitor_process(
+        &self,
+        env: *mut ErlNifEnv,
+        obj: *mut c_void,
+        mon: *const ErlNifMonitor,
+    ) -> Result<(), ResourceError> {
+        if env.is_null() || obj.is_null() || mon.is_null() {
+            return Err(ResourceError::BadArg);
+        }
+
+        let result = unsafe {
+            enif_demonitor_process(env, obj, mon)
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(ResourceError::BadArg)
+        }
+    }
+}
+
+/// Global resource manager instance
+/// 
+/// This can be swapped out for testing or different implementations
+static mut RESOURCE_MANAGER: Option<Box<dyn ResourceManager>> = None;
+static RESOURCE_MANAGER_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Initialize the global resource manager
+/// 
+/// This should be called once during NIF initialization
+pub fn init_resource_manager<T: ResourceManager + 'static>(manager: T) {
+    unsafe {
+        RESOURCE_MANAGER = Some(Box::new(manager));
+        RESOURCE_MANAGER_INIT.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Get a reference to the global resource manager
+/// 
+/// # Panics
+/// Panics if the resource manager hasn't been initialized
+pub fn get_resource_manager() -> &'static dyn ResourceManager {
+    if !RESOURCE_MANAGER_INIT.load(core::sync::atomic::Ordering::SeqCst) {
+        panic!("Resource manager not initialized. Call init_resource_manager() first.");
+    }
+    
+    unsafe {
+        RESOURCE_MANAGER.as_ref()
+            .expect("Resource manager should be initialized")
+            .as_ref()
+    }
+}
+
+/// Get a mutable reference to the global resource manager
+/// 
+/// # Safety
+/// This is unsafe because it provides mutable access to global state.
+/// Caller must ensure no other threads are accessing the manager.
+/// 
+/// # Panics  
+/// Panics if the resource manager hasn't been initialized
+pub unsafe fn get_resource_manager_mut() -> &'static mut dyn ResourceManager {
+    if !RESOURCE_MANAGER_INIT.load(core::sync::atomic::Ordering::SeqCst) {
+        panic!("Resource manager not initialized. Call init_resource_manager() first.");
+    }
+    
+    RESOURCE_MANAGER.as_mut()
+        .expect("Resource manager should be initialized")
+        .as_mut()
+}
+
+/// Helper for creating resource type initialization structs
+pub const fn resource_type_init() -> ErlNifResourceTypeInit {
+    ErlNifResourceTypeInit {
+        members: 0,
+        dtor: None,
+        stop: None,
+        down: None,
+    }
+}
+
+/// Helper for creating resource type initialization with destructor
+pub const fn resource_type_init_with_dtor(dtor: ErlNifResourceDtor) -> ErlNifResourceTypeInit {
+    ErlNifResourceTypeInit {
+        members: 1,
+        dtor: Some(dtor),
+        stop: None,
+        down: None,
+    }
+}
+
+/// Helper for creating resource type initialization with all callbacks
+pub const fn resource_type_init_full(
+    dtor: Option<ErlNifResourceDtor>,
+    stop: Option<ErlNifResourceStop>,
+    down: Option<ErlNifResourceDown>,
+) -> ErlNifResourceTypeInit {
+    let mut members = 0;
+    if dtor.is_some() { members += 1; }
+    if stop.is_some() { members += 1; }
+    if down.is_some() { members += 1; }
+    
+    ErlNifResourceTypeInit {
+        members,
+        dtor,
+        stop,
+        down,
+    }
+}
+
+/// Convenience functions that use the global resource manager or fallback to direct FFI
+/// Manually increment resource reference count
+pub fn keep_resource(resource: *mut c_void) -> NifResult<()> {
+    if RESOURCE_MANAGER_INIT.load(core::sync::atomic::Ordering::SeqCst) {
+        let manager = get_resource_manager();
+        manager.keep_resource(resource).map_err(|e| e.into())
+    } else {
+        // Fallback to direct FFI call if no manager is initialized
+        let result = unsafe { enif_keep_resource(resource) };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(NifError::BadArg)
+        }
+    }
+}
+
+/// Manually decrement resource reference count
+pub fn release_resource(resource: *mut c_void) -> NifResult<()> {
+    if RESOURCE_MANAGER_INIT.load(core::sync::atomic::Ordering::SeqCst) {
+        let manager = get_resource_manager();
+        manager.release_resource(resource).map_err(|e| e.into())
+    } else {
+        // Fallback to direct FFI call if no manager is initialized
+        let result = unsafe { enif_release_resource(resource) };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(NifError::BadArg)
+        }
+    }
+}
 
 /// Register a new resource type with AtomVM
 /// 
@@ -301,69 +726,4 @@ macro_rules! make_resource_term {
         };
         $crate::term::Term::from_raw(raw_term)
     }};
-}
-
-/// Manually increment resource reference count
-/// 
-/// Most users won't need this - automatic reference counting
-/// happens when resources are created/passed to Erlang
-pub fn keep_resource(resource: *mut c_void) -> NifResult<()> {
-    let result = unsafe { enif_keep_resource(resource) };
-    if result != 0 {
-        Ok(())
-    } else {
-        Err(NifError::BadArg)
-    }
-}
-
-/// Manually decrement resource reference count
-/// 
-/// Most users won't need this - automatic cleanup happens
-/// when Erlang GC removes the resource term
-pub fn release_resource(resource: *mut c_void) -> NifResult<()> {
-    let result = unsafe { enif_release_resource(resource) };
-    if result != 0 {
-        Ok(())
-    } else {
-        Err(NifError::BadArg)
-    }
-}
-
-/// Helper for creating resource type initialization structs
-pub const fn resource_type_init() -> ErlNifResourceTypeInit {
-    ErlNifResourceTypeInit {
-        members: 0,
-        dtor: None,
-        stop: None,
-        down: None,
-    }
-}
-
-/// Helper for creating resource type initialization with destructor
-pub const fn resource_type_init_with_dtor(dtor: ErlNifResourceDtor) -> ErlNifResourceTypeInit {
-    ErlNifResourceTypeInit {
-        members: 1,
-        dtor: Some(dtor),
-        stop: None,
-        down: None,
-    }
-}
-
-/// Helper for creating resource type initialization with all callbacks
-pub const fn resource_type_init_full(
-    dtor: Option<ErlNifResourceDtor>,
-    stop: Option<ErlNifResourceStop>,
-    down: Option<ErlNifResourceDown>,
-) -> ErlNifResourceTypeInit {
-    let mut members = 0;
-    if dtor.is_some() { members += 1; }
-    if stop.is_some() { members += 1; }
-    if down.is_some() { members += 1; }
-    
-    ErlNifResourceTypeInit {
-        members,
-        dtor,
-        stop,
-        down,
-    }
 }

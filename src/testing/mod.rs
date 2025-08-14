@@ -20,6 +20,9 @@ pub mod fixtures;
 pub mod nifs;
 
 #[cfg(test)]
+pub mod resources;
+
+#[cfg(test)]
 pub mod tagged;
 
 #[cfg(test)]
