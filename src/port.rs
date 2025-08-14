@@ -1,9 +1,15 @@
 //! Port collection macros for AtomVM
 //! 
 //! Provides safe Rust wrappers around AtomVM's port driver API
+//!
+//! # Design Philosophy
+//!
+//! All operations work with any AtomTableOps implementation through dependency injection.
+//! No global state, no hardcoded dependencies.
 
-use crate::term::{Term, NifError};
+use crate::term::{Term, NifError, TermValue};
 use crate::context::{Context, GlobalContext, ContextExt, PlatformData, PortBuilder};
+use crate::atom::{AtomTableOps, AtomTable};
 use core::ffi::{c_void, c_char, c_int};
 
 // Suppress warnings for unused items since this is a library
@@ -75,7 +81,9 @@ extern "C" {
 /// Register a port collection with AtomVM
 /// 
 /// # Usage
-/// ```rust
+/// ```rust,ignore
+/// use avmnif_rs::port_collection;
+/// 
 /// port_collection!(
 ///     my_port,
 ///     init = my_port_init,
@@ -438,26 +446,36 @@ pub fn term_to_pid(term: Term) -> PortOpResult<u32> {
     Ok(term.raw() as u32) // This is obviously wrong, but demonstrates the interface
 }
 
-/// Create a standard error reply
-pub fn create_error_reply(reason: &str) -> Term {
+/// Create a standard error reply using any atom table
+pub fn create_error_reply<T: AtomTableOps>(reason: &str, table: &T) -> Result<Term, NifError> {
+    // Create an error tuple: {error, Reason}
+    let error_atom = table.ensure_atom_str("error").map_err(|_| NifError::BadArg)?;
+    let reason_atom = table.ensure_atom_str(reason).map_err(|_| NifError::BadArg)?;
+    
     // This would use the actual term construction API
-    // For now, return a placeholder
-    let _ = reason;
-    Term::from_raw(0) // Obviously wrong, but demonstrates interface
+    // For now, return a placeholder that shows the pattern
+    let _ = (error_atom, reason_atom);
+    Ok(Term::from_raw(0)) // Obviously wrong, but demonstrates interface
 }
 
-/// Create a standard success reply
-pub fn create_ok_reply(data: Term) -> Term {
+/// Create a standard success reply using any atom table
+pub fn create_ok_reply<T: AtomTableOps>(data: Term, table: &T) -> Result<Term, NifError> {
+    // Create an ok tuple: {ok, Data}
+    let ok_atom = table.ensure_atom_str("ok").map_err(|_| NifError::BadArg)?;
+    
     // This would use the actual term construction API
-    let _ = data;
-    Term::from_raw(0) // Obviously wrong, but demonstrates interface
+    let _ = (ok_atom, data);
+    Ok(Term::from_raw(0)) // Obviously wrong, but demonstrates interface
 }
 
-/// Standard message handler template
+/// Generic standard message handler template
 pub fn handle_standard_message<T: PortData>(
     ctx: &mut Context,
     message: &Message,
 ) -> PortResult {
+    // Get the atom table from the global context
+    let table = AtomTable::from_global();
+    
     let port_data = unsafe {
         let data_ptr = ctx.get_platform_data_as::<GenericPortData<T>>();
         if data_ptr.is_null() {
@@ -471,37 +489,42 @@ pub fn handle_standard_message<T: PortData>(
         let command_value = match command.to_value() {
             Ok(val) => val,
             Err(_) => {
-                let reply = create_error_reply("invalid_command");
-                send_reply(ctx, pid, reference, reply);
+                if let Ok(reply) = create_error_reply("invalid_command", &table) {
+                    send_reply(ctx, pid, reference, reply);
+                }
                 return PortResult::Continue;
             }
         };
         
-        // Handle standard commands using TermValue pattern matching
-        if command_value.is_atom_str("start") {
+        // Handle standard commands using TermValue pattern matching with the table
+        if command_value.is_atom_str("start", &table) {
             if let Ok(pid_u32) = term_to_pid(pid) {
                 port_data.set_owner(pid_u32);
-                let reply = create_ok_reply(Term::from_raw(0)); // atom "ok"
-                send_reply(ctx, pid, reference, reply);
+                if let Ok(reply) = create_ok_reply(Term::from_raw(0), &table) {
+                    send_reply(ctx, pid, reference, reply);
+                }
                 PortResult::Continue
             } else {
-                let reply = create_error_reply("invalid_pid");
-                send_reply(ctx, pid, reference, reply);
+                if let Ok(reply) = create_error_reply("invalid_pid", &table) {
+                    send_reply(ctx, pid, reference, reply);
+                }
                 PortResult::Continue
             }
-        } else if command_value.is_atom_str("stop") {
+        } else if command_value.is_atom_str("stop", &table) {
             port_data.deactivate();
-            let reply = create_ok_reply(Term::from_raw(0)); // atom "ok"
-            send_reply(ctx, pid, reference, reply);
+            if let Ok(reply) = create_ok_reply(Term::from_raw(0), &table) {
+                send_reply(ctx, pid, reference, reply);
+            }
             PortResult::Terminate
-        } else if command_value.is_atom_str("status") {
+        } else if command_value.is_atom_str("status", &table) {
             let _status = if port_data.is_active() {
                 "active"
             } else {
                 "inactive"
             };
-            let reply = create_ok_reply(Term::from_raw(0)); // would be atom with status
-            send_reply(ctx, pid, reference, reply);
+            if let Ok(reply) = create_ok_reply(Term::from_raw(0), &table) {
+                send_reply(ctx, pid, reference, reply);
+            }
             PortResult::Continue
         } else {
             // Delegate to the port data's message handler

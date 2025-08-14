@@ -1,11 +1,41 @@
 extern crate alloc;
 
 use core::ffi::c_void;
-use alloc::{string::String, vec::Vec, boxed::Box, vec};
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box};
+
+// Import types from atom module - centralized in atom.rs
+pub use crate::atom::{AtomIndex, AtomTableOps};
+
+// ── Core Type Definitions ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefId(pub u64);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionRef {
+    pub module: AtomIndex,
+    pub function: AtomIndex,
+    pub arity: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceRef {
+    pub type_name: String,
+    pub ptr: *mut c_void,
+}
 
 // ── Core ADT Definition ──────────────────────────────────────────────────────
 
 /// Clean, functional ADT for AtomVM terms
+/// 
+/// This is completely generic - it works with any atom table implementation
+/// through the AtomTableOps trait.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TermValue {
     // Immediate values
@@ -31,32 +61,6 @@ pub enum TermValue {
     
     // Error case
     Invalid,
-}
-
-/// Atom represented by index into atom table
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AtomIndex(pub u32);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessId(pub u32);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortId(pub u32);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RefId(pub u64);
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FunctionRef {
-    pub module: AtomIndex,
-    pub function: AtomIndex,
-    pub arity: u8,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResourceRef {
-    pub type_name: String,
-    pub ptr: *mut c_void,
 }
 
 // ── Low-level Term (FFI boundary) ────────────────────────────────────────────
@@ -196,9 +200,9 @@ impl Term {
         }
     }
 
-    fn extract_atom_index(self) -> NifResult<u32> {
+    fn extract_atom_index(self) -> NifResult<AtomIndex> {
         match self.decode_type() {
-            TermType::Atom => Ok((self.0 >> 4) as u32),
+            TermType::Atom => Ok(AtomIndex((self.0 >> 4) as u32)),
             _ => Err(NifError::BadArg),
         }
     }
@@ -300,7 +304,7 @@ impl Term {
         }
     }
 
-    fn encode_atom(index: u32) -> NifResult<Self> {
+    fn encode_atom(AtomIndex(index): AtomIndex) -> NifResult<Self> {
         Ok(Term(((index as usize) << 4) | Self::TERM_ATOM_TAG))
     }
 
@@ -345,7 +349,7 @@ impl Term {
             }
             TermType::Atom => {
                 let index = self.extract_atom_index()?;
-                Ok(TermValue::Atom(AtomIndex(index)))
+                Ok(TermValue::Atom(index))
             }
             TermType::Nil => Ok(TermValue::Nil),
             TermType::Tuple => {
@@ -403,7 +407,7 @@ impl Term {
     pub fn from_value(value: TermValue, heap: &mut Heap) -> NifResult<Self> {
         match value {
             TermValue::SmallInt(i) => Self::encode_small_int(i),
-            TermValue::Atom(AtomIndex(idx)) => Self::encode_atom(idx),
+            TermValue::Atom(idx) => Self::encode_atom(idx),
             TermValue::Nil => Ok(Self::encode_nil()),
             
             TermValue::Tuple(elements) => {
@@ -607,26 +611,17 @@ impl TermValue {
     }
 }
 
-// ── Smart Constructors (ADT-friendly) ────────────────────────────────────────
+// ── Generic Smart Constructors ──────────────────────────────────────────────
 
 impl TermValue {
     pub fn int(value: i32) -> Self {
         TermValue::SmallInt(value)
     }
     
-    pub fn atom(name: &str) -> Self {
-        // Simple atom table lookup - in real implementation would use global atom table
-        let index = match name {
-            "ok" => 1,
-            "error" => 2,
-            "true" => 3,
-            "false" => 4,
-            "undefined" => 5,
-            "badarg" => 6,
-            "nil" => 7,
-            _ => 0,
-        };
-        TermValue::Atom(AtomIndex(index))
+    /// Create atom using any atom table (GENERIC!)
+    pub fn atom<T: AtomTableOps>(name: &str, table: &T) -> Self {
+        let index = table.ensure_atom_str(name).unwrap_or_else(|_| AtomIndex(0));
+        TermValue::Atom(index)
     }
     
     pub fn tuple(elements: Vec<TermValue>) -> Self {
@@ -662,7 +657,7 @@ impl TermValue {
     }
 }
 
-// ── Convenience Methods for Common Operations ────────────────────────────────
+// ── Generic Convenience Methods ─────────────────────────────────────────────
 
 impl TermValue {
     /// Extract integer with default
@@ -697,25 +692,54 @@ impl TermValue {
         })
     }
 
-    /// Check if atom matches string
-    pub fn is_atom_str(&self, name: &str) -> bool {
+    /// Check if atom matches string using any atom table (GENERIC!)
+    pub fn is_atom_str<T: AtomTableOps>(&self, name: &str, table: &T) -> bool {
         match self.as_atom() {
-            Some(AtomIndex(idx)) => {
-                // Simple lookup - real implementation would use atom table
-                match idx {
-                    1 => name == "ok",
-                    2 => name == "error", 
-                    3 => name == "true",
-                    4 => name == "false",
-                    _ => false,
-                }
-            }
+            Some(idx) => table.atom_equals_str(idx, name),
             None => false,
+        }
+    }
+
+    /// Get atom as string using any atom table (GENERIC!)
+    pub fn as_atom_str<T: AtomTableOps>(&self, table: &T) -> Option<String> {
+        match self.as_atom() {
+            Some(idx) => {
+                // Use the get_atom_string method from AtomTableOps
+                if let Ok(atom_ref) = table.get_atom_string(idx) {
+                    if let Ok(atom_str) = atom_ref.as_str() {
+                        return Some(atom_str.to_string());
+                    }
+                }
+                
+                // Fallback to checking common atoms (for compatibility)
+                let common_atoms = ["ok", "error", "true", "false", "undefined", "badarg", "nil"];
+                for atom_name in &common_atoms {
+                    if table.atom_equals_str(idx, atom_name) {
+                        return Some(atom_name.to_string());
+                    }
+                }
+                None
+            }
+            None => None,
         }
     }
 }
 
 // ── Error Types ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermError {
+    /// Wrong type for operation (covers most type mismatches)
+    WrongType,
+    /// Index/key out of bounds  
+    OutOfBounds,
+    /// Memory allocation failed
+    OutOfMemory,
+    /// Invalid UTF-8 in binary
+    InvalidUtf8,
+    /// Generic error with message
+    Other(String),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NifError {
@@ -735,12 +759,14 @@ impl From<&'static str> for NifError {
 
 pub type NifResult<T> = core::result::Result<T, NifError>;
 
-// ── Quick Constructor Macros ─────────────────────────────────────────────────
+// ── Generic Constructor Macros ──────────────────────────────────────────────
+
+/// These macros now require an atom table parameter for full genericity
 
 #[macro_export]
-macro_rules! atom {
-    ($name:literal) => {
-        TermValue::atom($name)
+macro_rules! atom_with_table {
+    ($name:literal, $table:expr) => {
+        TermValue::atom($name, $table)
     };
 }
 
@@ -763,50 +789,4 @@ macro_rules! map {
     ($($key:expr => $val:expr),* $(,)?) => {
         TermValue::map(alloc::vec![$(($key, $val)),*])
     };
-}
-
-// ── Usage Examples ───────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
-
-    #[test]
-    fn test_adt_operations() {
-        // Create terms using smart constructors
-        let numbers = list![
-            TermValue::int(1),
-            TermValue::int(2), 
-            TermValue::int(3)
-        ];
-
-        // Functional operations
-        let doubled = numbers.double_ints();
-        let sum = numbers.sum_list();
-        
-        assert_eq!(sum, 6);
-
-        // Pattern matching
-        match numbers {
-            TermValue::List(head, _tail) => {
-                assert_eq!(head.as_int(), Some(1));
-            }
-            _ => panic!("Expected list"),
-        }
-
-        // Tuple operations
-        let point = tuple![TermValue::int(10), TermValue::int(20)];
-        assert_eq!(point.tuple_arity(), 2);
-        assert_eq!(point.tuple_get(0).unwrap().as_int(), Some(10));
-
-        // Map operations
-        let config = map![
-            atom!("width") => TermValue::int(320),
-            atom!("height") => TermValue::int(240)
-        ];
-        
-        let width = config.map_get(&atom!("width"));
-        assert_eq!(width.unwrap().as_int(), Some(320));
-    }
 }

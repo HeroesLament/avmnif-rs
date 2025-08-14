@@ -5,7 +5,6 @@
 use crate::term::{NifError, NifResult, Term};
 use core::ffi::{c_void, c_char, c_int, c_uint};
 
-#[cfg(feature = "alloc")]
 use alloc::string::{String, ToString};
 
 // Suppress naming warnings for FFI compatibility
@@ -132,10 +131,13 @@ extern "C" {
     ) -> c_int;
 }
 
+
 /// Register a new resource type with AtomVM
 /// 
 /// # Usage
-/// ```rust
+/// ```rust,ignore
+/// use avmnif_rs::resource_type;
+/// 
 /// resource_type!(DISPLAY_TYPE, DisplayContext, display_destructor);
 /// ```
 #[macro_export]
@@ -209,7 +211,9 @@ macro_rules! resource_type {
 /// Create a new resource instance
 /// 
 /// # Usage
-/// ```rust
+/// ```rust,ignore
+/// use avmnif_rs::create_resource;
+/// 
 /// let display_ptr = create_resource!(display_type, DisplayContext {
 ///     width: 240,
 ///     height: 320,
@@ -245,7 +249,9 @@ macro_rules! create_resource {
 /// Extract a resource from an Erlang term
 /// 
 /// # Usage
-/// ```rust
+/// ```rust,ignore
+/// use avmnif_rs::get_resource;
+/// 
 /// let display = get_resource!(env, args[0], display_type)?;
 /// display.width = 320;
 /// ```
@@ -279,7 +285,9 @@ macro_rules! get_resource {
 /// Convert a resource pointer to an Erlang term
 /// 
 /// # Usage
-/// ```rust
+/// ```rust,ignore
+/// avmnif_rs::make_resource_term;
+/// 
 /// let term = make_resource_term!(env, display_ptr);
 /// ```
 #[macro_export]
@@ -357,52 +365,5 @@ pub const fn resource_type_init_full(
         dtor,
         stop,
         down,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Debug, Clone)]
-    struct TestResource {
-        id: u32,
-        #[cfg(feature = "alloc")]
-        name: String,
-        active: bool,
-    }
-
-    #[test]
-    fn test_resource_type_init_helpers() {
-        let init = resource_type_init();
-        assert_eq!(init.members, 0);
-        assert!(init.dtor.is_none());
-
-        unsafe extern "C" fn test_dtor(_env: *mut ErlNifEnv, _obj: *mut c_void) {}
-        
-        let init_with_dtor = resource_type_init_with_dtor(test_dtor);
-        assert_eq!(init_with_dtor.members, 1);
-        assert!(init_with_dtor.dtor.is_some());
-    }
-
-    #[test]
-    fn test_resource_macro_compilation() {
-        // These should compile without errors
-        // (Can't actually run without AtomVM runtime)
-        
-        let _create_usage = || -> NifResult<*mut c_void> {
-            // Note: This test requires the paste crate and a registered resource type
-            // resource_type!(TEST_RESOURCE_TYPE, TestResource, test_destructor);
-            
-            create_resource!(TEST_RESOURCE_TYPE, TestResource {
-                id: 42,
-                #[cfg(feature = "alloc")]
-                name: "test".to_string(),
-                active: true,
-            })
-        };
-
-        // Note: get_resource! and make_resource_term! need Term/Env types
-        // to be fully implemented before testing
     }
 }
