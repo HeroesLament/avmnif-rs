@@ -1,6 +1,6 @@
 [package]
 name = "avmnif-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description     = "Safe NIF toolkit for AtomVM written in Rust"
 license         = "MIT"
@@ -9,7 +9,6 @@ documentation   = "https://docs.rs/avmnif-rs"
 readme          = "README.md"
 
 [dependencies]
-cc = "1.2.32"
 paste = "1.0.15"
 
 
